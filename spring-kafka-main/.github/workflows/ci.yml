@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - main-internal
+      - '*.x'
+      - '*.x-internal'
+
+concurrency:
+  group: group-ci-for-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        testJavaVersion: [ 17, 21, 25, 26 ]
+        os: ${{ fromJSON(vars.COMMERCIAL && '["ubuntu22-2-8"]' || '["ubuntu-latest", "macos-latest"]') }}
+        exclude:
+          - os: ${{ vars.COMMERCIAL && 'ubuntu22-2-8' || 'ubuntu-latest' }}
+            testJavaVersion: 25
+
+    uses: spring-io/spring-github-workflows/.github/workflows/spring-gradle-ci.yml@main
+    with:
+      testJavaVersion: ${{ matrix.testJavaVersion }}
+      runner: ${{ matrix.os }}
+    secrets:
+      DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+      ARTIFACTORY_USERNAME: ${{ secrets.COMMERCIAL_ARTIFACTORY_USERNAME }}
+      ARTIFACTORY_PASSWORD: ${{ secrets.COMMERCIAL_ARTIFACTORY_PASSWORD }}
+      NOTIFICATIONS_CHAT_WEBHOOK_URL: ${{ secrets.NOTIFICATIONS_CHAT_WEBHOOK_URL }}

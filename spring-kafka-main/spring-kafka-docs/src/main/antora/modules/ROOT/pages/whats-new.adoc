@@ -1,0 +1,96 @@
+= What's new?
+
+[[whats-new-in-4-2-since-4.1]]
+== What's New in 4.2 Since 4.1
+:page-section-summary-toc: 1
+
+This section covers the changes made from version 4.1 to version 4.2.
+For changes in earlier versions, see xref:appendix/change-history.adoc[Change History].
+
+[[x42-container-lifecycle-metrics]]
+=== Container Lifecycle Metrics
+
+The listener container now automatically tracks start and stop counts using Micrometer counters (`spring.kafka.container.start.count` and `spring.kafka.container.stop.count`), tagged with the container bean name.
+See xref:kafka/micrometer.adoc#monitoring-container-lifecycle[Monitoring Listener Container Lifecycle] for more information.
+
+[[x42-container-factory-kafka-admin]]
+=== `KafkaAdmin` on the Listener Container Factory
+
+`AbstractKafkaListenerContainerFactory` now exposes a `setKafkaAdmin(KafkaAdmin)`.
+The configured `KafkaAdmin` is applied to every container the factory creates, which the container uses to resolve the cluster id for observation.
+See xref:kafka/container-factory.adoc[Container Factory].
+
+[[x42-await-async-results-on-stop]]
+=== Awaiting Async Listener Results on Container Stop
+
+The new container property `awaitAsyncResultsOnStop` binds in-flight asynchronous listener results (`CompletableFuture`, `Mono`, Kotlin `suspend`) to the container's lifecycle.
+When `true`, the consumer thread waits for outstanding results within the `shutdownTimeout` before closing the consumer, committing the offsets of results as they complete; results still outstanding when the timeout expires are cancelled, are not acknowledged, and their records are redelivered.
+The property is `false` by default.
+See xref:kafka/receiving-messages/async-returns.adoc#async-returns-stop[Async Results and Container Stop].
+
+[[x42-error-handler-partition-scoped-clear]]
+=== Partition-Scoped Thread State Clearing in Error Handlers
+
+`CommonErrorHandler` now has a `clearThreadStateFor(Collection<TopicPartition>)` default method.
+In a non-concurrent container with multiple partitions, the container calls this method after a successful batch to clear retry state only for the partitions present in that batch, rather than wiping state for all partitions via `clearThreadState()`.
+This fixes a bug where a healthy batch from one partition would reset the backoff retry counter for an unrelated failing partition, preventing broken records from ever reaching the dead-letter topic.
+Implementations of `CommonErrorHandler` that maintain per-partition state (such as custom subclasses of `FailedRecordProcessor`) may override this method to apply the same scoping.
+
+[[x42-error-handler-max-recovery-failures]]
+=== Bounded Recovery Failures in Error Handlers
+
+`DefaultErrorHandler` and `DefaultAfterRollbackProcessor` (via `FailedRecordProcessor`) now have a `setMaxRecoveryFailures(int)` property.
+When the recoverer keeps throwing for the same record (for example, the dead-letter topic is unavailable), the record was previously seeked to and redelivered indefinitely.
+With the limit set, when the recoverer throws for the nth time the record is logged at `ERROR` level and treated as recovered, so the consumer moves past its offset.
+`RetryListener.recoveryFailed()` is still called for every failure, including the last one; `RetryListener.recovered()` is not, because recovery never succeeded.
+This applies to record listeners only.
+By default, there is no limit.
+See xref:kafka/annotation-error-handling.adoc#default-eh[Default Error Handler].
+
+[[x42-listener-observation-tags]]
+=== Listener Observation Meter Tags
+
+When `observationEnabled` is `true`, batch listeners create a batch-level observation (unless `recordObservationsInBatch` is enabled for per-record observations) using the same low-cardinality meter tags as non-batch listeners.
+Optional tag values use the Micrometer placeholder `none` when unavailable.
+This prevents Prometheus registration failures when an application mixes batch and non-batch listeners under the `spring.kafka.listener` meter name.
+See xref:kafka/micrometer.adoc#batch-listener-obs[Batch Listener Observations].
+
+==== Backward Compatibility
+
+These changes affect existing meters and dashboards:
+
+* **Batch listeners with `observationEnabled=true`:** Previously these used legacy `MicrometerHolder` timers with `name` / `result` / `exception` tags.
+They now emit observation-based meters with `messaging.*` tags (and Micrometer's `error` tag).
+Dashboards or recording rules that matched the old tag structure will stop matching and must be updated to the observation tag keys.
+
+* **All listeners (batch and non-batch) without a consumer group:** `messaging.kafka.consumer.group` was previously omitted from the low-cardinality tag set when no group was configured.
+It is now always present with value `none` (and the same applies to high-cardinality optional tags such as `messaging.kafka.client_id` and `messaging.consumer.id` when unavailable).
+Exact label-set matching queries that assumed the tag was absent need to be revised.
+
+These behavioral changes are intentional so that all `spring.kafka.listener` meters share one consistent tag key set for Prometheus.
+They ship in **4.2** only (they cannot be backported to 4.1).
+
+[[x42-share-container-client-instance-ids]]
+=== Client Instance IDs for Share Consumers
+
+`ShareKafkaMessageListenerContainer` now exposes `getClientInstanceIds(Duration)`, returning the broker-assigned client _instance ids_ (KIP-714 telemetry `Uuid` values) of the running share consumers, keyed by `client.id`.
+This lets client-reported metrics be correlated with broker-side telemetry.
+See xref:kafka/kafka-queues.adoc#share-container-client-instance-ids[Client Instance IDs (Telemetry)].
+
+[[x42-share-record-message-converter]]
+=== Record Message Converter for Share Consumer Listeners
+
+`ShareKafkaListenerContainerFactory` now supports a `RecordMessageConverter` via `setRecordMessageConverter(RecordMessageConverter)`, wired through to the listener adapter for record listeners the same way as the classic `AbstractKafkaListenerContainerFactory`.
+Previously the share consumer stack always created the adapter with no converter.
+Listener result forwarding (`@SendTo` and reply handling) for share consumers remains a follow-up.
+See xref:kafka/kafka-queues.adoc[Kafka Queues (Share Consumers)].
+
+[[x42-header-mapper-from-user-header]]
+=== Converted-Value `fromUserHeader` Overload for Header Mappers
+
+`AbstractKafkaHeaderMapper` now provides a `protected fromUserHeader(String, Object, Map<String, Object>)` overload that accepts an already-converted header value and adds it to the target headers, collecting values for headers matching a multi-value pattern into a `List`.
+Custom `AbstractKafkaHeaderMapper` subclasses that decode header values themselves can route through this method to honor the configured multi-value header patterns without re-implementing the collection logic.
+This complements the existing `fromUserHeader(String, Header, Map<String, Object>)` method.
+
+The overload was introduced while fixing a defect where inbound multi-value headers carrying a `spring_json_header_types` entry (any non-`byte[]` value, such as `String` or `Integer`) collapsed to their last value instead of being collected into a `List`, contradicting the documented behavior.
+See xref:kafka/headers.adoc#multi-value-header[Support multi-value header mapping].

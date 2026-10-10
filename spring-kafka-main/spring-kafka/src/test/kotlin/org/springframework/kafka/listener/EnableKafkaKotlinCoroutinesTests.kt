@@ -1,0 +1,535 @@
+/*
+ * Copyright 2016-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.kafka.listener
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.consumer.ConsumerRecord
+import org.apache.kafka.clients.producer.ProducerConfig
+import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.kafka.common.serialization.StringSerializer
+import org.assertj.core.api.Assertions.assertThat
+import org.awaitility.Awaitility.await
+import org.junit.jupiter.api.Test
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Configuration
+import org.springframework.kafka.annotation.EnableKafka
+import org.springframework.kafka.annotation.KafkaHandler
+import org.springframework.kafka.annotation.KafkaListener
+import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry
+import org.springframework.kafka.core.ConsumerFactory
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory
+import org.springframework.kafka.core.DefaultKafkaProducerFactory
+import org.springframework.kafka.core.KafkaTemplate
+import org.springframework.kafka.core.ProducerFactory
+import org.springframework.kafka.support.Acknowledgment
+import org.springframework.kafka.test.EmbeddedKafkaBroker
+import org.springframework.kafka.test.context.EmbeddedKafka
+import org.springframework.kafka.test.utils.KafkaTestUtils
+import org.springframework.messaging.handler.annotation.SendTo
+import org.springframework.test.annotation.DirtiesContext
+import org.springframework.test.context.junit.jupiter.SpringJUnitConfig
+import org.springframework.util.backoff.FixedBackOff
+import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+
+/**
+ * Kotlin Annotated async return listener tests.
+ *
+ * @author Wang ZhiYang
+ * @author Artem Bilan
+ * @author Youngjoo Kim
+ * @author Nikita Kibitkin
+ *
+ * @since 3.1
+ */
+@SpringJUnitConfig
+@DirtiesContext
+@EmbeddedKafka(topics = ["kotlinAsyncTestTopic1", "kotlinAsyncTestTopic2",
+		"kotlinAsyncBatchTestTopic1", "kotlinAsyncBatchTestTopic2", "kotlinReplyTopic1",
+		"kotlinAsyncTestTopicCommonHandler", "kotlinAsyncTestTopicBoundedRetry",
+		"kotlinAsyncTestTopicTwoRecordRetry", "kotlinAsyncTestTopicBurstRetry",
+		"kotlinAsyncTestTopicAwaitOnStop", "kotlinAsyncTestTopicCancelOnStop"], partitions = 1)
+class EnableKafkaKotlinCoroutinesTests {
+
+	@Autowired
+	private lateinit var config: Config
+
+	@Autowired
+	private lateinit var template: KafkaTemplate<String, String>
+
+	@Autowired
+	private lateinit var registry: KafkaListenerEndpointRegistry
+
+	@Autowired
+	private lateinit var broker: EmbeddedKafkaBroker
+
+	@Test
+	fun `test listener`() {
+		this.template.send("kotlinAsyncTestTopic1", "foo")
+		assertThat(this.config.latch1.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.received).isEqualTo("foo")
+		await()
+			.untilAsserted {
+				assertThat(KafkaTestUtils.getPropertyValue(this.config.acknowledgment, "acked"))
+					.isEqualTo(java.lang.Boolean.TRUE)
+			}
+	}
+
+	@Test
+	fun `test checkedEx`() {
+		this.template.send("kotlinAsyncTestTopic2", "fail")
+		assertThat(this.config.latch2.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.error).isTrue()
+	}
+
+	@Test
+	fun `test batch listener`() {
+		this.template.send("kotlinAsyncBatchTestTopic1", "foo")
+		assertThat(this.config.batchLatch1.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.batchReceived).isEqualTo("foo")
+	}
+
+	@Test
+	fun `test batch checkedEx`() {
+		this.template.send("kotlinAsyncBatchTestTopic2", "fail")
+		assertThat(this.config.batchLatch2.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.batchError).isTrue()
+	}
+
+	@Test
+	fun `test checkedKh reply`() {
+		this.template.send("kotlinAsyncTestTopic3", "foo")
+		val cr = this.template.receive("kotlinReplyTopic1", 0, 0, Duration.ofSeconds(30))
+		assertThat(cr?.value() ?: "null").isEqualTo("FOO")
+	}
+
+	@Test
+	fun `test suspend function with CommonErrorHandler`() {
+		this.template.send("kotlinAsyncTestTopicCommonHandler", "fail")
+		assertThat(this.config.commonHandlerLatch.await(10, TimeUnit.SECONDS)).isTrue()
+	}
+
+	@Test
+	fun `test suspend function bounded retries with CommonErrorHandler`() {
+		// GH-4465: FixedBackOff(interval, n) must stop at n + 1 deliveries. The
+		// recovered latch only signals the first recovery, so the delivery
+		// counter is the actual regression check.
+		this.template.send("kotlinAsyncTestTopicBoundedRetry", "fail")
+		assertThat(this.config.boundedRetryRecoveredLatch.await(10, TimeUnit.SECONDS)).isTrue()
+		await()
+			.pollDelay(Duration.ofSeconds(2))
+			.atMost(Duration.ofSeconds(3))
+			.untilAsserted {
+				assertThat(this.config.boundedRetryDeliveries.get()).isEqualTo(3)
+			}
+	}
+
+	@Test
+	fun `test suspend function bounded burst stays linear with N`() {
+		// GH-4504: assert the burst stays linear (upper bound N * (n + 2)); the
+		// pre-fix quadratic N * (N + 2) blows past it. Bound not exact so
+		// poll-batching does not flake the assertion.
+		val burstSize = 10
+		val maxRetries = 2L
+		this.config.burstRetryRecoveredLatch = CountDownLatch(burstSize)
+		this.config.burstRetryDeliveries.set(0)
+		repeat(burstSize) { idx ->
+			this.template.send("kotlinAsyncTestTopicBurstRetry", "burst-$idx")
+		}
+		assertThat(this.config.burstRetryRecoveredLatch.await(60, TimeUnit.SECONDS)).isTrue()
+		await()
+			.pollDelay(Duration.ofSeconds(2))
+			.atMost(Duration.ofSeconds(4))
+			.untilAsserted {
+				assertThat(this.config.burstRetryDeliveries.get())
+					.isBetween(burstSize * (maxRetries.toInt() + 1), burstSize * (maxRetries.toInt() + 2))
+			}
+	}
+
+	@Test
+	fun `test suspend function bounded retries for two records on the same partition`() {
+		// GH-4504: two always-failing records on the same partition — the
+		// earlier-offset record was silently skipped past the recoverer under
+		// the bug. After the fix both reach the recoverer.
+		this.template.send("kotlinAsyncTestTopicTwoRecordRetry", "r1")
+		this.template.send("kotlinAsyncTestTopicTwoRecordRetry", "r2")
+		assertThat(this.config.twoRecordRetryRecoveredLatch.await(15, TimeUnit.SECONDS)).isTrue()
+		await()
+			.pollDelay(Duration.ofSeconds(2))
+			.atMost(Duration.ofSeconds(3))
+			.untilAsserted {
+				assertThat(this.config.twoRecordRetryRecoveries["r1"]).isEqualTo(1)
+				assertThat(this.config.twoRecordRetryRecoveries["r2"]).isEqualTo(1)
+				assertThat(this.config.twoRecordRetryDeliveries["r1"]).isEqualTo(3)
+				// r2's count varies with poll timing (3 if r1 finishes before r2
+				// is polled; up to 5 if they share polls). The strict linear
+				// bound is asserted by the burst test; the primary proof here is
+				// the recoveries assertion above.
+				assertThat(this.config.twoRecordRetryDeliveries["r2"]).isBetween(3, 5)
+			}
+	}
+
+	@Test
+	fun `test suspend function completed within shutdown timeout is acknowledged`() {
+		this.template.send("kotlinAsyncTestTopicAwaitOnStop", "foo").get(10, TimeUnit.SECONDS)
+		assertThat(this.config.awaitOnStopStarted.await(10, TimeUnit.SECONDS)).isTrue()
+		val stopped = CountDownLatch(1)
+		var pendingAtStop = -1L
+		this.registry.getListenerContainer("kotlin-await-on-stop")!!.stop {
+			pendingAtStop = this.config.awaitOnStopDone.count
+			stopped.countDown()
+		}
+		// the container waits for the in-flight result
+		assertThat(stopped.await(1, TimeUnit.SECONDS)).isFalse()
+		this.config.awaitOnStopGate.complete(Unit)
+		assertThat(stopped.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(pendingAtStop).isEqualTo(0L)
+		assertThat(committedOffset("kotlin-await-on-stop", "kotlinAsyncTestTopicAwaitOnStop")).isEqualTo(1L)
+	}
+
+	@Test
+	fun `test suspend function not completed within shutdown timeout is cancelled and redelivered`() {
+		this.template.send("kotlinAsyncTestTopicCancelOnStop", "foo").get(10, TimeUnit.SECONDS)
+		await().until { this.config.cancelOnStopStarted.get() == 1 }
+		val container = this.registry.getListenerContainer("kotlin-cancel-on-stop")!!
+		val stopped = CountDownLatch(1)
+		container.stop { stopped.countDown() }
+		assertThat(stopped.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.cancelOnStopCancelled.await(10, TimeUnit.SECONDS)).isTrue()
+		assertThat(this.config.cancelOnStopDone.get()).isEqualTo(0)
+		assertThat(committedOffset("kotlin-cancel-on-stop", "kotlinAsyncTestTopicCancelOnStop")).isNull()
+		// the cancelled record is redelivered on restart
+		container.start()
+		await().until { this.config.cancelOnStopStarted.get() == 2 }
+		this.config.cancelOnStopGate.complete(Unit)
+		await().until { this.config.cancelOnStopDone.get() == 1 }
+		await().untilAsserted {
+			assertThat(committedOffset("kotlin-cancel-on-stop", "kotlinAsyncTestTopicCancelOnStop")).isEqualTo(1L)
+		}
+	}
+
+	private fun committedOffset(group: String, topic: String): Long? =
+		KafkaTestUtils.getCurrentOffset(this.broker.brokersAsString, group, topic, 0)?.offset()
+
+	@KafkaListener(id = "sendTopic", topics = ["kotlinAsyncTestTopic3"],
+			containerFactory = "kafkaListenerContainerFactory")
+	class Listener {
+
+		@KafkaHandler
+		@SendTo("kotlinReplyTopic1")
+		suspend fun handler1(value: String) : String {
+			return value.uppercase()
+		}
+
+	}
+
+	@Configuration
+	@EnableKafka
+	class Config {
+
+		@Volatile
+		lateinit var received: String
+
+		lateinit var acknowledgment: Acknowledgment
+
+		@Volatile
+		lateinit var batchReceived: String
+
+		@Volatile
+		var error: Boolean = false
+
+		@Volatile
+		var batchError: Boolean = false
+
+		val latch1 = CountDownLatch(1)
+
+		val latch2 = CountDownLatch(1)
+
+		val batchLatch1 = CountDownLatch(1)
+
+		val batchLatch2 = CountDownLatch(1)
+
+		val commonHandlerLatch = CountDownLatch(1)
+
+		val boundedRetryDeliveries = AtomicInteger()
+
+		val boundedRetryRecoveredLatch = CountDownLatch(1)
+
+		val twoRecordRetryDeliveries = ConcurrentHashMap<String, Int>()
+
+		val twoRecordRetryRecoveries = ConcurrentHashMap<String, Int>()
+
+		// One countdown per record so the test waits until BOTH records have been recovered.
+		val twoRecordRetryRecoveredLatch = CountDownLatch(2)
+
+		val burstRetryDeliveries = AtomicInteger()
+
+		@Volatile
+		var burstRetryRecoveredLatch = CountDownLatch(1)
+
+		val awaitOnStopStarted = CountDownLatch(1)
+
+		val awaitOnStopGate = CompletableDeferred<Unit>()
+
+		val awaitOnStopDone = CountDownLatch(1)
+
+		// Counts deliveries: the first is cancelled on stop, the second is the redelivery.
+		val cancelOnStopStarted = AtomicInteger()
+
+		val cancelOnStopGate = CompletableDeferred<Unit>()
+
+		val cancelOnStopCancelled = CountDownLatch(1)
+
+		val cancelOnStopDone = AtomicInteger()
+
+		@Value("\${" + EmbeddedKafkaBroker.SPRING_EMBEDDED_KAFKA_BROKERS + "}")
+		private lateinit var brokerAddresses: String
+
+		@Bean
+		fun listener() : Listener {
+			return Listener()
+		}
+
+		@Bean
+		fun kpf(): ProducerFactory<String, String> {
+			val configs = HashMap<String, Any>()
+			configs[ProducerConfig.BOOTSTRAP_SERVERS_CONFIG] = this.brokerAddresses
+			configs[ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG] = StringSerializer::class.java
+			configs[ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG] = StringSerializer::class.java
+			return DefaultKafkaProducerFactory(configs)
+		}
+
+		@Bean
+		fun kcf(): ConsumerFactory<String, String> {
+			val configs = HashMap<String, Any>()
+			configs[ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG] = this.brokerAddresses
+			configs[ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG] = StringDeserializer::class.java
+			configs[ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG] = StringDeserializer::class.java
+			configs[ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG] = false
+			configs[ConsumerConfig.AUTO_OFFSET_RESET_CONFIG] = "earliest"
+			return DefaultKafkaConsumerFactory(configs)
+		}
+
+		@Bean
+		fun kt(): KafkaTemplate<String, String> {
+			val kafkaTemplate = KafkaTemplate(kpf())
+			kafkaTemplate.setConsumerFactory(kcf())
+			return kafkaTemplate
+		}
+
+		@Bean
+		fun errorHandler() : KafkaListenerErrorHandler {
+			return KafkaListenerErrorHandler { message, _ ->
+				error = true
+				latch2.countDown()
+				message.payload
+			}
+		}
+
+		@Bean
+		fun errorHandlerBatch() : KafkaListenerErrorHandler {
+			return KafkaListenerErrorHandler { message, _ ->
+				batchError = true
+				batchLatch2.countDown()
+				message.payload
+			}
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactory(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+				= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.setReplyTemplate(kt())
+			return factory
+		}
+
+		@Bean
+		fun kafkaBatchListenerContainerFactory(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setBatchListener(true)
+			factory.setConsumerFactory(kcf())
+			return factory
+		}
+
+		@Bean
+		fun commonErrorHandler(): DefaultErrorHandler {
+			return DefaultErrorHandler { record, exception ->
+				commonHandlerLatch.countDown()
+			}
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactoryWithCommonHandler(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.setCommonErrorHandler(commonErrorHandler())
+			return factory
+		}
+
+		@Bean
+		fun boundedRetryErrorHandler(): DefaultErrorHandler {
+			return DefaultErrorHandler({ _, _ -> boundedRetryRecoveredLatch.countDown() },
+					FixedBackOff(100L, 2L))
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactoryWithBoundedRetry(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.setCommonErrorHandler(boundedRetryErrorHandler())
+			return factory
+		}
+
+		@Bean
+		fun twoRecordRetryErrorHandler(): DefaultErrorHandler {
+			return DefaultErrorHandler({ record, _ ->
+				twoRecordRetryRecoveries.merge(record.value() as String, 1, Int::plus)
+				twoRecordRetryRecoveredLatch.countDown()
+			}, FixedBackOff(100L, 2L))
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactoryWithTwoRecordRetry(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.setCommonErrorHandler(twoRecordRetryErrorHandler())
+			return factory
+		}
+
+		@Bean
+		fun burstRetryErrorHandler(): DefaultErrorHandler {
+			return DefaultErrorHandler({ _, _ -> burstRetryRecoveredLatch.countDown() },
+					FixedBackOff(100L, 2L))
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactoryWithBurstRetry(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.setCommonErrorHandler(burstRetryErrorHandler())
+			return factory
+		}
+
+		@Bean
+		fun kafkaListenerContainerFactoryAwaitOnStop(): ConcurrentKafkaListenerContainerFactory<String, String> {
+			val factory: ConcurrentKafkaListenerContainerFactory<String, String>
+					= ConcurrentKafkaListenerContainerFactory()
+			factory.setConsumerFactory(kcf())
+			factory.containerProperties.isAwaitAsyncResultsOnStop = true
+			factory.containerProperties.shutdownTimeout = 2000
+			return factory
+		}
+
+		@KafkaListener(id = "kotlin", topics = ["kotlinAsyncTestTopic1"],
+				containerFactory = "kafkaListenerContainerFactory")
+		suspend fun listen(value: String, acknowledgment: Acknowledgment) {
+			this.received = value
+			this.acknowledgment = acknowledgment
+			this.latch1.countDown()
+		}
+
+		@KafkaListener(id = "kotlin-ex", topics = ["kotlinAsyncTestTopic2"],
+				containerFactory = "kafkaListenerContainerFactory", errorHandler = "errorHandler")
+		suspend fun listenEx(value: String) {
+			if (value == "fail") {
+				throw Exception("checked")
+			}
+		}
+
+		@KafkaListener(id = "kotlin-batch", topics = ["kotlinAsyncBatchTestTopic1"], containerFactory = "kafkaBatchListenerContainerFactory")
+		suspend fun batchListen(values: List<ConsumerRecord<String, String>>) {
+			this.batchReceived = values.first().value()
+			this.batchLatch1.countDown()
+		}
+
+		@KafkaListener(id = "kotlin-batch-ex", topics = ["kotlinAsyncBatchTestTopic2"],
+				containerFactory = "kafkaBatchListenerContainerFactory", errorHandler = "errorHandlerBatch")
+		suspend fun batchListenEx(values: List<ConsumerRecord<String, String>>) {
+			if (values.first().value() == "fail") {
+				throw Exception("checked")
+			}
+		}
+
+		@KafkaListener(id = "kotlin-common-handler", topics = ["kotlinAsyncTestTopicCommonHandler"],
+				containerFactory = "kafkaListenerContainerFactoryWithCommonHandler")
+		suspend fun listenWithCommonHandler(value: String) {
+			if (value == "fail") {
+				throw RuntimeException("Test exception for CommonErrorHandler")
+			}
+		}
+
+		@KafkaListener(id = "kotlin-bounded-retry", topics = ["kotlinAsyncTestTopicBoundedRetry"],
+				containerFactory = "kafkaListenerContainerFactoryWithBoundedRetry")
+		suspend fun listenBoundedRetry(value: String) {
+			boundedRetryDeliveries.incrementAndGet()
+			throw RuntimeException("Always fail (bounded retry)")
+		}
+
+		@KafkaListener(id = "kotlin-two-record-retry", topics = ["kotlinAsyncTestTopicTwoRecordRetry"],
+				containerFactory = "kafkaListenerContainerFactoryWithTwoRecordRetry")
+		suspend fun listenTwoRecordRetry(value: String) {
+			twoRecordRetryDeliveries.merge(value, 1, Int::plus)
+			throw RuntimeException("Always fail (two-record retry)")
+		}
+
+		@KafkaListener(id = "kotlin-burst-retry", topics = ["kotlinAsyncTestTopicBurstRetry"],
+				containerFactory = "kafkaListenerContainerFactoryWithBurstRetry")
+		suspend fun listenBurstRetry(value: String) {
+			burstRetryDeliveries.incrementAndGet()
+			throw RuntimeException("Always fail (burst retry)")
+		}
+
+		@KafkaListener(id = "kotlin-await-on-stop", topics = ["kotlinAsyncTestTopicAwaitOnStop"],
+				containerFactory = "kafkaListenerContainerFactoryAwaitOnStop")
+		suspend fun listenAwaitOnStop(value: String) {
+			awaitOnStopStarted.countDown()
+			awaitOnStopGate.await()
+			awaitOnStopDone.countDown()
+		}
+
+		@KafkaListener(id = "kotlin-cancel-on-stop", topics = ["kotlinAsyncTestTopicCancelOnStop"],
+				containerFactory = "kafkaListenerContainerFactoryAwaitOnStop")
+		suspend fun listenCancelOnStop(value: String) {
+			cancelOnStopStarted.incrementAndGet()
+			try {
+				cancelOnStopGate.await()
+			}
+			catch (e: CancellationException) {
+				cancelOnStopCancelled.countDown()
+				throw e
+			}
+			cancelOnStopDone.incrementAndGet()
+		}
+
+	}
+
+}

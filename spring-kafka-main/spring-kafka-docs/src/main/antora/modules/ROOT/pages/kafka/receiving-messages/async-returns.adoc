@@ -1,0 +1,92 @@
+[[async-returns]]
+= Asynchronous `@KafkaListener` Return Types
+
+Starting with version 3.2, `@KafkaListener` (and `@KafkaHandler`) methods can be specified with asynchronous return types, letting the reply be sent asynchronously.
+return types include `CompletableFuture<?>`, `Mono<?>` and Kotlin `suspend` functions.
+
+[source, java]
+----
+@KafkaListener(id = "myListener", topics = "myTopic")
+public CompletableFuture<String> listen(String data) {
+    ...
+    CompletableFuture<String> future = new CompletableFuture<>();
+    future.complete("done");
+    return future;
+}
+----
+
+[source, java]
+----
+@KafkaListener(id = "myListener", topics = "myTopic")
+public Mono<Void> listen(String data) {
+    ...
+    return Mono.empty();
+}
+----
+
+IMPORTANT: The `AckMode` will be automatically set the `MANUAL` and enable out-of-order commits when async return types are detected; instead, the asynchronous completion will ack when the async operation completes.
+When the async result is completed with an error, whether the message is recover or not depends on the container error handler.
+If some exception occurs within the listener method that prevents creation of the async result object, you MUST catch that exception and return an appropriate return object that will cause the message to be ack or recover.
+
+If a `KafkaListenerErrorHandler` is configured on a listener with an async return type (including Kotlin suspend functions), the error handler is invoked after a failure.
+See xref:kafka/annotation-error-handling.adoc[Handling Exceptions] for more information about this error handler and its purpose.
+
+[[async-returns-stop]]
+== Async Results and Container Stop
+
+By default, stopping the container does not wait for in-flight async results: the consumer thread leaves the poll loop, commits the offsets acknowledged so far and closes the consumer, while the async work returned by the listener keeps running on its own threads.
+During application shutdown this work can outlive the container stop and run against downstream beans (a database client, an HTTP client) that are destroyed after the container's `SmartLifecycle` phase; the acknowledgment of a result that completes after the stop is lost as well.
+
+Starting with version 4.2, set the container property `awaitAsyncResultsOnStop` to `true` to bind in-flight async results to the container's lifecycle.
+The consumer thread then waits for the outstanding results, within the container's `shutdownTimeout` measured from the stop request, before committing pending offsets and closing the consumer.
+Results that complete in time are acknowledged and their offsets committed as they complete.
+Results still outstanding when the timeout expires are cancelled: the `Mono` subscription is disposed (which cancels a suspend function's coroutine), or `CompletableFuture.cancel(true)` is called (which does not interrupt code that is already running).
+A cancelled result is neither acknowledged nor passed to the error handler, so its record is redelivered after the partition is reassigned - the usual at-least-once contract for async listeners.
+
+Because the container's stop callback fires only after this wait, the container's lifecycle phase completes after the in-flight work has finished or been cancelled, and beans that are destroyed later in the shutdown sequence are no longer used by listener work.
+The `shutdownTimeout` therefore needs to cover the time the async work takes to complete; use a longer timeout if the work is expected to be cancelled too often.
+
+The blocking `stop()` still returns after `shutdownTimeout` at the latest.
+When results are cancelled at the timeout, the cancellation and the consumer close complete shortly after `stop()` returns, as for a blocking listener that runs past the timeout; the offsets of the results that completed during the wait are already committed at that point.
+The callback based `stop(Runnable)`, which the application context uses on shutdown, runs the callback only after the consumer is closed.
+
+[source, java]
+----
+@Bean
+ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
+        ConsumerFactory<String, String> consumerFactory) {
+
+    ConcurrentKafkaListenerContainerFactory<String, String> factory = new ConcurrentKafkaListenerContainerFactory<>();
+    factory.setConsumerFactory(consumerFactory);
+    factory.getContainerProperties().setAwaitAsyncResultsOnStop(true);
+    factory.getContainerProperties().setShutdownTimeout(30_000);
+    return factory;
+}
+----
+
+[IMPORTANT]
+====
+With a seek-after-handling error handler such as `DefaultErrorHandler`, an async listener receives one extra dispatch-loop delivery per failing record on the same partition compared to a blocking listener.
+The dispatch loop invokes the listener on every polled record before any async failure callback fires, so the first poll of a poison-pill burst invokes every record once before any retry state is registered on the partition.
+After that, subsequent retry cycles of the head record skip the records queued behind it, so the total invocation count stays linear with the burst size rather than growing with backlog depth.
+
+For `N` always-failing records on a single partition with `maxAttempts = n`, the suspend listener receives `N * (n + 2) - 1` total invocations vs the blocking listener's `N * (n + 1)`.
+The iter-0 dispatch invocation cannot be elided without giving up the per-poll parallelism that is the point of async listeners.
+This does not affect blocking listeners, because the synchronous throw aborts the batch iteration before the later records are invoked.
+
+If your listener performs non-idempotent work per delivery (an outbound HTTP call, a DB write that is not transactional with the offset commit), prefer one of the following:
+
+* Use `@RetryableTopic` (non-blocking retry).
+  Failing records are routed to a separate retry topic so the main partition keeps advancing and no record receives an extra dispatch-loop delivery.
+* Make the listener idempotent (the Kafka default at-least-once delivery already expects this).
+
+This choice can be made per topic rather than application-wide.
+Events whose correctness depends on strict per-partition ordering (for example, state transitions keyed by an entity id) can stay on a seek-based handler and rely on partition count plus key distribution for throughput.
+Events that do not require ordering (search index updates, notifications, downstream enrichment) can run on `@RetryableTopic` listeners so a failing record does not receive an extra dispatch-loop delivery.
+
+Async return types also do not preserve per-partition processing order when records on the same partition have mixed outcomes: while a failing record is in its retry / backoff cycle, a successful later-offset record on the same partition can complete its listener body first.
+Kafka still delivers in order and the committed offset stays consistent, but the listener bodies run concurrently, so the side effects can land out of partition order.
+A blocking listener avoids this because it processes the partition strictly one record at a time — the earlier-offset record runs to completion (success or recovery) before the next record on the partition is invoked.
+If your consumer relies on per-key processing order (idempotent updates keyed by entity id, ordered state transitions), the blocking listener is the correct model regardless of which error handler you use.
+====
+

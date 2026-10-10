@@ -1,0 +1,520 @@
+buildscript {
+	ext.isCI = System.getenv('GITHUB_ACTION')
+	ext.kotlinVersion = '2.4.20'
+	repositories {
+		gradlePluginPortal()
+		mavenCentral()
+	}
+	dependencies {
+		classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion"
+		classpath "org.jetbrains.kotlin:kotlin-allopen:$kotlinVersion"
+	}
+}
+
+plugins {
+	id 'base'
+	id 'idea'
+	alias(libs.plugins.aggregate.javadoc)
+	alias(libs.plugins.nullability) apply false
+}
+
+
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+
+description = 'Spring for Apache Kafka'
+
+ext {
+	linkHomepage = 'https://github.com/spring-projects/spring-kafka'
+	linkCi = 'https://github.com/spring-projects/spring-kafka/actions/workflows/ci-snapshot.yml'
+	linkIssue = 'https://github.com/spring-projects/spring-kafka/issues'
+	linkScmUrl = 'https://github.com/spring-projects/spring-kafka'
+	linkScmConnection = 'https://github.com/spring-projects/spring-kafka.git'
+	linkScmDevConnection = 'git@github.com:spring-projects/spring-kafka.git'
+
+	idPrefix = 'kafka'
+
+	javaProjects = subprojects - project(':spring-kafka-bom') - project(':spring-kafka-docs')
+
+}
+
+gradle.projectsEvaluated {
+	int processors = Runtime.runtime.availableProcessors()
+	int testForks = processors.intdiv(2) ?: 1
+	int maxWorkers = gradle.startParameter.maxWorkerCount
+	String workersLabel = maxWorkers > 0 ? String.valueOf(maxWorkers) : "default (~${processors})"
+	rootProject.logger.lifecycle(
+			"Parallelism: {} processors (Runtime), test maxParallelForks={}, Gradle maxWorkers={}",
+			processors, testForks, workersLabel)
+}
+
+allprojects {
+	group = 'org.springframework.kafka'
+
+	repositories {
+		mavenCentral()
+		maven { url 'https://repo.spring.io/milestone' }
+		if (version.endsWith('SNAPSHOT')) {
+			maven { url 'https://repo.spring.io/snapshot' }
+			maven { url 'https://oss.sonatype.org/content/repositories/snapshots' }
+		}
+//		maven { url 'https://repository.apache.org/content/groups/staging/' }
+	}
+
+	configurations {
+		dependencyManagement {
+			canBeConsumed = false
+			canBeResolved = false
+		}
+
+		configureEach {
+			resolutionStrategy.cacheChangingModulesFor 0, 'minutes'
+		}
+	}
+
+	dependencies {
+		dependencyManagement(platform(libs.com.fasterxml.jackson.bom))
+		dependencyManagement(platform(libs.tools.jackson.bom))
+		dependencyManagement(platform(libs.org.junit.bom))
+		dependencyManagement(platform(libs.spring.framework.bom))
+		dependencyManagement(platform(libs.io.projectreactor.bom))
+		dependencyManagement(platform(libs.apache.logging.log4j.bom))
+		dependencyManagement(platform(libs.spring.data.bom))
+		dependencyManagement(platform(libs.io.micrometer.bom))
+		dependencyManagement(platform(libs.io.micrometer.tracing.bom))
+	}
+}
+
+apply from: "${rootProject.projectDir}/publish-maven.gradle"
+
+if (System.getenv('ARTIFACTORY_USERNAME')) {
+	apply from: "${rootProject.projectDir}/commercial-settings.gradle"
+}
+
+configure(javaProjects) { subproject ->
+	apply plugin: 'java-library'
+	apply plugin: 'eclipse'
+	apply plugin: 'idea'
+	apply plugin: 'checkstyle'
+	apply plugin: 'kotlin'
+	apply plugin: 'kotlin-spring'
+	apply plugin: 'io.spring.nullability'
+
+	java {
+		toolchain {
+			languageVersion = JavaLanguageVersion.of(25)
+		}
+		withJavadocJar()
+		withSourcesJar()
+		registerFeature('optional') {
+			usingSourceSet(sourceSets.main)
+		}
+	}
+
+	tasks.withType(JavaCompile).configureEach {
+		sourceCompatibility = JavaVersion.VERSION_17
+		options.encoding = 'UTF-8'
+	}
+
+	tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask).configureEach {
+		compilerOptions {
+			jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+			javaParameters = true
+			allWarningsAsErrors = true
+		}
+	}
+
+	eclipse.project.natures += 'org.springframework.ide.eclipse.core.springnature'
+
+	configurations {
+		[compileClasspath, runtimeClasspath, testCompileClasspath, testRuntimeClasspath].each {
+			it.extendsFrom(dependencyManagement)
+		}
+	}
+
+	// dependencies that are common across all java projects
+	dependencies {
+		compileOnly libs.com.github.spotbugs.annotations
+		testRuntimeOnly libs.com.github.spotbugs.annotations
+
+		testImplementation 'org.junit.jupiter:junit-jupiter-api'
+		testImplementation 'org.junit.jupiter:junit-jupiter-params'
+		testImplementation 'org.jetbrains.kotlin:kotlin-reflect'
+		testImplementation 'org.jetbrains.kotlin:kotlin-stdlib-jdk8'
+		testImplementation libs.org.awaitility
+		testImplementation libs.org.hamcrest.core
+		testImplementation libs.org.assertj.core
+
+		testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
+		testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+		testRuntimeOnly 'org.apache.logging.log4j:log4j-slf4j-impl'
+	}
+
+	// enable all compiler warnings; individual projects may customize further
+	[compileJava, compileTestJava]*.options*.compilerArgs = ['-Xlint:all,-options,-processing', '-parameters']
+
+	test {
+		// Default timeout for every testable method (unless @Timeout). Stops hung tests instead of wedging CI.
+		// Override: ./gradlew test -Djunit.jupiter.execution.timeout.default=PT20M  or  -PjunitTimeoutDefault=PT20M
+		def junitTimeoutDefault = System.getProperty('junit.jupiter.execution.timeout.default')
+				?: findProperty('junitTimeoutDefault')
+				?: 'PT10M'
+		systemProperty 'junit.jupiter.execution.timeout.default', junitTimeoutDefault
+
+		def failedTestsByClass = new ConcurrentHashMap<String, CopyOnWriteArrayList<String>>()
+		def skippedTestsByClass = new ConcurrentHashMap<String, CopyOnWriteArrayList<String>>()
+
+		addTestListener(new TestListener() {
+			@Override
+			void beforeSuite(TestDescriptor descriptor) {
+			}
+
+			@Override
+			void afterSuite(TestDescriptor descriptor, TestResult result) {
+			}
+
+			@Override
+			void beforeTest(TestDescriptor descriptor) {
+			}
+
+			@Override
+			void afterTest(TestDescriptor descriptor, TestResult result) {
+				String className = descriptor.className
+				if (className == null) {
+					return
+				}
+				String testId = descriptor.displayName ?: descriptor.name
+				if (result.resultType == TestResult.ResultType.FAILURE) {
+					failedTestsByClass.computeIfAbsent(className, { new CopyOnWriteArrayList<String>() }).add(testId)
+				}
+				else if (result.resultType == TestResult.ResultType.SKIPPED) {
+					skippedTestsByClass.computeIfAbsent(className, { new CopyOnWriteArrayList<String>() }).add(testId)
+				}
+			}
+		})
+
+		testLogging {
+			// Per-class summaries via afterSuite below; only log failures here (with stack traces).
+			events 'failed'
+			showStandardStreams = project.hasProperty('showStandardStreams') ?: false
+			showExceptions = true
+			showStackTraces = true
+			exceptionFormat = 'full'
+		}
+
+		afterSuite { desc, result ->
+			// Top-level class only (skip engine root, nested classes, and empty suites)
+			if (desc.className == null || result.testCount == 0 || desc.parent?.className != null) {
+				return
+			}
+			long classMs = result.endTime - result.startTime
+			String duration = classMs >= 60_000
+					? String.format("%.2f min", classMs / 60_000.0)
+					: classMs >= 10_000
+							? String.format("%.2fs", classMs / 1000.0)
+							: "${classMs}ms"
+			String fqn = desc.className
+			String simpleName = fqn.contains('.') ? fqn.substring(fqn.lastIndexOf('.') + 1) : fqn
+			long passed = result.testCount - result.failedTestCount - result.skippedTestCount
+			StringBuilder summary = new StringBuilder()
+			summary.append(simpleName).append(" finished in ").append(duration)
+					.append(" (").append(result.testCount).append(" tests")
+			if (result.failedTestCount > 0 || result.skippedTestCount > 0) {
+				if (passed > 0) {
+					summary.append(", ").append(passed).append(" passed")
+				}
+				if (result.failedTestCount > 0) {
+					summary.append(", ").append(result.failedTestCount).append(" failed")
+				}
+				if (result.skippedTestCount > 0) {
+					summary.append(", ").append(result.skippedTestCount).append(" skipped")
+				}
+			}
+			summary.append(')')
+			List<String> failedNames = failedTestsByClass.remove(fqn)
+			if (failedNames != null && !failedNames.isEmpty()) {
+				summary.append(" — failed: ").append(String.join("; ", failedNames))
+			}
+			List<String> skippedNames = skippedTestsByClass.remove(fqn)
+			if (skippedNames != null && !skippedNames.isEmpty()) {
+				summary.append(" — skipped: ").append(String.join("; ", skippedNames))
+			}
+			logger.lifecycle(summary.toString())
+		}
+
+		maxHeapSize = '1536m'
+		maxParallelForks = Runtime.runtime.availableProcessors().intdiv(2) ?: 1
+		useJUnitPlatform()
+
+		javaLauncher = javaToolchains.launcherFor {
+			languageVersion = JavaLanguageVersion.of(project.findProperty('testJavaVersion') ?: 25)
+		}
+
+	}
+
+	checkstyle {
+		configDirectory.set(file("${rootDir}/src/checkstyle"))
+		toolVersion = '13.2.0'
+	}
+
+	publishing {
+		publications {
+			mavenJava(MavenPublication) {
+				suppressAllPomMetadataWarnings()
+				from components.java
+			}
+		}
+	}
+
+	jar {
+		manifest {
+			attributes(
+					'Implementation-Version': archiveVersion,
+					'Build-Jdk-Spec': "${System.getProperty("java.specification.version")}",
+					'Implementation-Title': subproject.name,
+					'Implementation-Vendor-Id': subproject.group,
+					'Implementation-Vendor': 'Broadcom Inc.',
+					'Implementation-URL': linkHomepage,
+					'Automatic-Module-Name': subproject.name.replace('-', '.')  // for Jigsaw
+			)
+		}
+
+		from("${rootProject.projectDir}/src/dist") {
+			include 'notice.txt'
+			into 'META-INF'
+			expand(copyright: new Date().format('yyyy'), version: project.version)
+		}
+		from("${rootProject.projectDir}") {
+			include 'LICENSE.txt'
+			into 'META-INF'
+		}
+	}
+
+	tasks.withType(Javadoc) {
+		options.addBooleanOption('Xdoclint:syntax', true) // only check syntax with doclint
+		options.addBooleanOption('Werror', true) // fail build on Javadoc warnings
+        options.addBooleanOption('-no-fonts', true) // exclude fonts from module javadoc
+	}
+
+}
+
+project ('spring-kafka') {
+	description = 'Spring Kafka Support'
+
+	dependencies {
+		api 'org.springframework:spring-context'
+		api 'org.springframework:spring-messaging'
+		api 'org.springframework:spring-tx'
+		api libs.apache.kafka.clients
+		api 'io.micrometer:micrometer-observation'
+
+		optionalApi libs.apache.kafka.streams
+		optionalApi libs.org.jetbrains.kotlinx.coroutines.reactor
+		optionalApi 'com.fasterxml.jackson.core:jackson-core'
+		optionalApi 'com.fasterxml.jackson.core:jackson-databind'
+		optionalApi 'com.fasterxml.jackson.datatype:jackson-datatype-jdk8'
+		optionalApi 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310'
+		optionalApi 'com.fasterxml.jackson.datatype:jackson-datatype-joda'
+		optionalApi 'com.fasterxml.jackson.module:jackson-module-kotlin'
+		optionalApi 'tools.jackson.core:jackson-databind'
+		optionalApi 'tools.jackson.datatype:jackson-datatype-joda'
+		optionalApi 'tools.jackson.module:jackson-module-kotlin'
+		optionalApi 'org.springframework.data:spring-data-commons'
+		optionalApi libs.com.jayway.jsonpath
+		optionalApi 'io.projectreactor:reactor-core'
+		optionalApi 'io.micrometer:micrometer-core'
+		optionalApi 'io.micrometer:micrometer-tracing'
+
+		testImplementation project (':spring-kafka-test')
+		testImplementation 'io.projectreactor:reactor-test'
+		testImplementation libs.org.mockito.junit.jupiter
+		testImplementation libs.org.hibernate.validator
+		testImplementation 'io.micrometer:micrometer-tracing-integration-test'
+	}
+
+	tasks.withType(JavaForkOptions) {
+		jvmArgs '--enable-native-access=ALL-UNNAMED'
+	}
+}
+
+project('spring-kafka-bom') {
+	description = 'Spring for Apache Kafka (Bill of Materials)'
+
+	apply plugin: 'java-platform'
+
+	dependencies {
+		constraints {
+			javaProjects.sort { it.name }.each {
+				api it
+			}
+		}
+	}
+
+	publishing {
+		publications {
+			mavenJava(MavenPublication) {
+				from components.javaPlatform
+			}
+		}
+	}
+}
+
+project ('spring-kafka-test') {
+	description = 'Spring Kafka Test Support'
+
+	dependencies {
+		api libs.org.slf4j.api
+		api 'org.springframework:spring-context'
+		api 'org.springframework:spring-test'
+		api(libs.apache.kafka.clients) { artifact { classifier = 'test' } }
+		api libs.apache.kafka.server
+		api libs.apache.kafka.test.common.runtime
+		api libs.apache.kafka.metadata
+		api libs.apache.kafka.server.common
+		api(libs.apache.kafka.server.common) { artifact { classifier = 'test' } }
+		api libs.apache.kafka.streams.test.utils
+		api 'org.junit.jupiter:junit-jupiter-api'
+		api 'org.junit.platform:junit-platform-launcher'
+
+		optionalApi libs.org.hamcrest.core
+		optionalApi libs.org.mockito.core
+		optionalApi 'org.apache.logging.log4j:log4j-core'
+		optionalApi libs.org.assertj.core
+	}
+}
+
+configurations {
+	micrometerDocs
+}
+
+dependencies {
+	micrometerDocs libs.io.micrometer.docs.generator
+}
+
+def observationInputDir = file('spring-kafka/src/main/java/org/springframework/kafka/support/micrometer').absolutePath
+def generatedDocsDir = file('build/docs/generated').absolutePath
+
+tasks.register('generateObservabilityDocs', JavaExec) {
+	mainClass = 'io.micrometer.docs.DocsGeneratorCommand'
+	inputs.dir(observationInputDir)
+	outputs.dir(generatedDocsDir)
+	classpath configurations.micrometerDocs
+	args observationInputDir, /.+/, generatedDocsDir
+}
+
+tasks.register('filterMetricsDocsContent', Copy) {
+	dependsOn generateObservabilityDocs
+	from generatedDocsDir
+	include '_*.adoc'
+	into generatedDocsDir
+	rename { filename -> filename.replace '_', '' }
+	filter { line -> line.replaceAll('org.springframework.kafka.support.micrometer.', '').replaceAll('^Fully qualified n', 'N') }
+}
+
+dependencies {
+	javaProjects.each {
+		javadoc it
+	}
+}
+
+configurations.javadocClasspath.extendsFrom(configurations.dependencyManagement)
+
+javadoc {
+	title = "${rootProject.description} ${version} API"
+	options {
+		encoding = 'UTF-8'
+		memberLevel = JavadocMemberLevel.PROTECTED
+		author = true
+		header = project.description
+		use = true
+		overview = 'src/api/overview.html'
+		splitIndex = true
+		links('https://docs.oracle.com/en/java/javase/17/docs/api/',
+				'https://jakarta.ee/specifications/platform/11/apidocs/',
+				'https://docs.spring.io/spring-framework/docs/current/javadoc-api/')
+		addBooleanOption('Xdoclint:syntax', true) // only check syntax with doclint
+	}
+
+	destinationDir = file('build/api')
+
+	notCompatibleWithConfigurationCache('Task requires resolving transitive dependencies from all subprojects')
+
+	doFirst {
+		classpath += files(javaProjects.collect { it.sourceSets.main.compileClasspath })
+	}
+}
+
+tasks.register('api') {
+	group = 'Documentation'
+	description = 'Generates aggregated Javadoc API documentation.'
+	dependsOn javadoc
+}
+
+tasks.register('docsZip', Zip) {
+	group = 'Distribution'
+	archiveClassifier = 'docs'
+	description = "Builds -${archiveClassifier} archive containing api and reference " +
+			"for deployment at static.spring.io/spring-kafka/docs."
+
+	from('src/dist') {
+		include 'changelog.txt'
+	}
+
+	from(javadoc) {
+		into 'api'
+	}
+}
+
+tasks.register('distZip', Zip) {
+	dependsOn 'docsZip'
+	group = 'Distribution'
+	archiveClassifier = 'dist'
+	description = "Builds -${archiveClassifier} archive, containing all jars and docs, " +
+			"suitable for community download page."
+
+	def baseDir = "${project.name}-${project.version}"
+
+	from('src/dist') {
+		include 'readme.txt'
+		include 'notice.txt'
+		into baseDir
+	}
+
+	from("$project.rootDir") {
+		include 'LICENSE.txt'
+		into baseDir
+	}
+
+	from(zipTree(docsZip.archiveFile)) {
+		into "${baseDir}/docs"
+	}
+
+	javaProjects.each { subproject ->
+		into ("${baseDir}/libs") {
+			from subproject.jar
+			from subproject.sourcesJar
+			from subproject.javadocJar
+		}
+	}
+
+	from(project(':spring-kafka-bom').generatePomFileForMavenJavaPublication) {
+		into "${baseDir}/libs"
+		rename 'pom-default.xml', "spring-kafka-bom-${project.version}.xml"
+	}
+
+}
+
+tasks.register('dist') {
+	dependsOn assemble
+	group = 'Distribution'
+	description = 'Builds -dist, -docs distribution archives.'
+}
+
+publishing {
+	publications {
+		mavenJava(MavenPublication) {
+			artifact docsZip
+			artifact distZip
+		}
+	}
+}

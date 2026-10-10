@@ -1,0 +1,1100 @@
+/*
+ * Copyright 2025-present the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.springframework.kafka.listener;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
+
+import org.apache.kafka.clients.consumer.AcknowledgeType;
+import org.apache.kafka.clients.consumer.AcknowledgementCommitCallback;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.ShareConsumer;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.Uuid;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.kafka.config.KafkaListenerEndpoint;
+import org.springframework.kafka.config.ShareKafkaListenerContainerFactory;
+import org.springframework.kafka.core.ShareConsumerFactory;
+import org.springframework.kafka.event.ConsumerFailedToStartEvent;
+import org.springframework.kafka.event.ConsumerStartedEvent;
+import org.springframework.kafka.event.ConsumerStartingEvent;
+import org.springframework.kafka.event.ConsumerStoppedEvent;
+import org.springframework.kafka.event.ConsumerStoppedEvent.Reason;
+import org.springframework.kafka.event.ShareConsumerStoppingEvent;
+import org.springframework.kafka.listener.ContainerProperties.ShareAckMode;
+import org.springframework.kafka.support.ShareAcknowledgment;
+import org.springframework.kafka.support.TopicPartitionOffset;
+import org.springframework.kafka.support.converter.RecordMessageConverter;
+import org.springframework.kafka.test.utils.KafkaTestUtils;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.BDDMockito.given;
+import static org.mockito.BDDMockito.willAnswer;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+
+/**
+ * Unit tests for {@link ShareKafkaMessageListenerContainer}.
+ * These tests focus on configuration validation and setup logic.
+ * Message processing, acknowledgment behavior, and error handling are covered
+ * by integration tests in {@link ShareKafkaMessageListenerContainerIntegrationTests}.
+ *
+ * @author Soby Chacko
+ * @author Maxwell Balla
+ * @author Kumar Gaurav
+ * @author OhKyu Chan
+ * @author Burak Kalayci
+ * @author Jiyeon Kim
+ * @author Ngoc Nhan
+ * @since 4.0
+ */
+@ExtendWith(MockitoExtension.class)
+public class ShareKafkaMessageListenerContainerUnitTests {
+
+	@Mock
+	private ShareConsumerFactory<String, String> shareConsumerFactory;
+
+	@Mock
+	private MessageListener<String, String> messageListener;
+
+	@Mock
+	private AcknowledgingShareConsumerAwareMessageListener<String, String> ackListener;
+
+	@Test
+	void shouldDefaultToExplicitAckMode() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getContainerProperties().getShareAckMode()).isEqualTo(ShareAckMode.EXPLICIT);
+	}
+
+	@Test
+	void shouldConfigureImplicitAckMode() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.IMPLICIT);
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getContainerProperties().getShareAckMode()).isEqualTo(ShareAckMode.IMPLICIT);
+	}
+
+	@Test
+	void shouldConfigureManualAckMode() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.MANUAL);
+		containerProperties.setMessageListener(ackListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getContainerProperties().getShareAckMode()).isEqualTo(ShareAckMode.MANUAL);
+	}
+
+	@Test
+	void shouldFailWhenManualAckModeUsedWithNonAcknowledgingListener() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.MANUAL);
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThatExceptionOfType(IllegalStateException.class)
+				.isThrownBy(container::start)
+				.withMessageContaining("ShareAckMode.MANUAL requires an AcknowledgingShareConsumerAwareMessageListener");
+	}
+
+	@Test
+	void shouldNotFailWhenManualAckModeUsedWithAcknowledgingListener() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.MANUAL);
+		containerProperties.setMessageListener(ackListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getContainerProperties().getShareAckMode()).isEqualTo(ShareAckMode.MANUAL);
+	}
+
+	@Test
+	@SuppressWarnings("deprecation")
+	void deprecatedSetExplicitShareAcknowledgmentShouldDelegateToShareAckMode() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+
+		containerProperties.setExplicitShareAcknowledgment(true);
+		assertThat(containerProperties.getShareAckMode()).isEqualTo(ShareAckMode.MANUAL);
+		assertThat(containerProperties.isExplicitShareAcknowledgment()).isTrue();
+
+		containerProperties.setExplicitShareAcknowledgment(false);
+		assertThat(containerProperties.getShareAckMode()).isEqualTo(ShareAckMode.EXPLICIT); // false maps to EXPLICIT (container-managed), not IMPLICIT
+		assertThat(containerProperties.isExplicitShareAcknowledgment()).isFalse();
+	}
+
+	@Test
+	void shouldRejectInvalidConcurrency() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> container.setConcurrency(0))
+				.withMessageContaining("concurrency must be greater than 0");
+
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> container.setConcurrency(-1))
+				.withMessageContaining("concurrency must be greater than 0");
+	}
+
+	@Test
+	void shouldRejectTopicPatternAtConstruction() {
+		ContainerProperties containerProperties = new ContainerProperties(Pattern.compile("test-.*"));
+
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> new ShareKafkaMessageListenerContainer<>(this.shareConsumerFactory,
+						containerProperties))
+				.withMessage("'topics' must be provided");
+	}
+
+	@Test
+	void shouldRejectTopicPartitionsAtConstruction() {
+		ContainerProperties containerProperties =
+				new ContainerProperties(new TopicPartitionOffset("test-topic", 0));
+
+		assertThatIllegalArgumentException()
+				.isThrownBy(() -> new ShareKafkaMessageListenerContainer<>(this.shareConsumerFactory,
+						containerProperties))
+				.withMessage("'topics' must be provided");
+	}
+
+	@Test
+	void shouldSupportBeanNameSetting() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		container.setBeanName("testContainer");
+		assertThat(container.getBeanName()).isEqualTo("testContainer");
+		assertThat(container.getListenerId()).isEqualTo("testContainer");
+	}
+
+	@Test
+	void shouldSupportDefaultBeanNameSetting() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getBeanName()).isEqualTo("noBeanNameSet");
+		assertThat(container.getListenerId()).isEqualTo("noBeanNameSet");
+	}
+
+	@Test
+	void shouldReportRunningStateBeforeStart() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.isRunning()).isFalse();
+	}
+
+	@Test
+	void shouldUseRejectingRecovererByDefault() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getShareConsumerRecordRecoverer()).isSameAs(ShareConsumerRecordRecoverer.REJECTING);
+	}
+
+	@Test
+	void shouldAllowCustomShareConsumerRecordRecoverer() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		ShareConsumerRecordRecoverer customRecoverer = (record, ex) -> AcknowledgeType.RELEASE;
+		container.setShareConsumerRecordRecoverer(customRecoverer);
+
+		assertThat(container.getShareConsumerRecordRecoverer()).isSameAs(customRecoverer);
+	}
+
+	/**
+	 * The programmatic entry point must configure the container the same way the
+	 * endpoint-driven one does. {@code createListenerContainer(KafkaListenerEndpoint)}
+	 * calls {@code initializeContainer(...)}; {@code createContainer(String...)} must
+	 * too, otherwise every factory-level setting is silently dropped.
+	 */
+	@Test
+	void createContainerByTopicsShouldApplyFactoryConfiguration() {
+		ShareConsumerRecordRecoverer customRecoverer = (record, ex) -> AcknowledgeType.RELEASE;
+		ApplicationEventPublisher publisher = mock(ApplicationEventPublisher.class);
+		ShareKafkaListenerContainerFactory<String, String> factory =
+				new ShareKafkaListenerContainerFactory<>(shareConsumerFactory);
+		factory.setShareConsumerRecordRecoverer(customRecoverer);
+		factory.setApplicationEventPublisher(publisher);
+		factory.setAutoStartup(false);
+		factory.setPhase(42);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				factory.createContainer("test-topic");
+
+		assertThat(container.getShareConsumerRecordRecoverer()).isSameAs(customRecoverer);
+		assertThat(container.getApplicationEventPublisher()).isSameAs(publisher);
+		assertThat(container.isAutoStartup()).isFalse();
+		assertThat(container.getPhase()).isEqualTo(42);
+	}
+
+	@Test
+	void factoryShouldApplyShareConsumerRecordRecovererToContainer() {
+		ShareConsumerRecordRecoverer customRecoverer = (record, ex) -> AcknowledgeType.RELEASE;
+		ShareKafkaListenerContainerFactory<String, String> factory =
+				new ShareKafkaListenerContainerFactory<>(shareConsumerFactory);
+		factory.setShareConsumerRecordRecoverer(customRecoverer);
+
+		KafkaListenerEndpoint endpoint = mock(KafkaListenerEndpoint.class);
+		given(endpoint.getTopics()).willReturn(java.util.List.of("test-topic"));
+		given(endpoint.getConcurrency()).willReturn(null);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				factory.createListenerContainer(endpoint);
+
+		assertThat(container.getShareConsumerRecordRecoverer()).isSameAs(customRecoverer);
+	}
+
+	@Test
+	void factoryShouldPropagateRecordMessageConverterToEndpoint() {
+		RecordMessageConverter messageConverter = mock();
+		ShareKafkaListenerContainerFactory<String, String> factory =
+				new ShareKafkaListenerContainerFactory<>(shareConsumerFactory);
+		factory.setRecordMessageConverter(messageConverter);
+
+		KafkaListenerEndpoint endpoint = mock();
+		given(endpoint.getTopics()).willReturn(List.of("test-topic"));
+		given(endpoint.getConcurrency()).willReturn(null);
+
+		ShareKafkaMessageListenerContainer<String, String> container = factory.createListenerContainer(endpoint);
+
+		verify(endpoint).setupListenerContainer(container, messageConverter);
+	}
+
+	@Test
+	void factoryShouldPreserveDefaultMessageConverterBehavior() {
+		ShareKafkaListenerContainerFactory<String, String> factory =
+				new ShareKafkaListenerContainerFactory<>(shareConsumerFactory);
+
+		KafkaListenerEndpoint endpoint = mock();
+		given(endpoint.getTopics()).willReturn(List.of("test-topic"));
+		given(endpoint.getConcurrency()).willReturn(null);
+
+		ShareKafkaMessageListenerContainer<String, String> container = factory.createListenerContainer(endpoint);
+
+		verify(endpoint).setupListenerContainer(container, null);
+	}
+
+	/**
+	 * Verifies that even when the factory has share.acknowledgement.mode=implicit in its
+	 * base configuration, the container passes share.acknowledgement.mode=explicit as an
+	 * override when creating the consumer. This is the critical contract: the container
+	 * must enforce explicit mode regardless of what the factory is configured with.
+	 */
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldPassExplicitOverrideToConsumerEvenWhenFactoryConfigIsImplicit() {
+		ShareConsumerFactory<String, String> conflictingFactory = mock(ShareConsumerFactory.class);
+		given(conflictingFactory.getConfigurationProperties())
+				.willReturn(Map.of(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "implicit"));
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(conflictingFactory.createShareConsumer(any(), any(), any()))
+				.willReturn(mockConsumer);
+		lenient().when(mockConsumer.poll(any())).thenReturn(null);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.EXPLICIT);
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(conflictingFactory, containerProperties);
+		container.setBeanName("conflictWarningContainer");
+		container.start();
+		container.stop();
+
+		verify(conflictingFactory).createShareConsumer(
+				any(),
+				any(),
+				eq(Map.of(ConsumerConfig.SHARE_ACKNOWLEDGEMENT_MODE_CONFIG, "explicit")));
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldUseClientIdFromContainerProperties() {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+		containerProperties.setClientId("share-client-from-properties");
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("clientIdFromPropertiesContainer");
+		container.start();
+		container.stop();
+
+		verify(mockFactory).createShareConsumer(any(), eq("share-client-from-properties"), any());
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldPreferTheClientIdSetOnTheContainer() {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+		containerProperties.setClientId("share-client-from-properties");
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("clientIdOnContainerContainer");
+		container.setClientId("share-client-on-container");
+		container.start();
+		container.stop();
+
+		verify(mockFactory).createShareConsumer(any(), eq("share-client-on-container"), any());
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldFallBackToTheBeanNameWhenNoClientIdIsConfigured() {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("beanNameFallbackContainer");
+		container.start();
+		container.stop();
+
+		verify(mockFactory).createShareConsumer(any(), eq("beanNameFallbackContainer"), any());
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldUseCommitSyncByDefault() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ConsumerRecord<String, String> record = new ConsumerRecord<>("test-topic", 0, 0L, "key", "value");
+		ConsumerRecords<String, String> records = new ConsumerRecords<>(
+				Map.of(new TopicPartition("test-topic", 0), List.of(record)), Map.of());
+
+		AtomicBoolean firstPoll = new AtomicBoolean(true);
+		given(mockConsumer.poll(any())).willAnswer(invocation -> {
+			if (firstPoll.compareAndSet(true, false)) {
+				return records;
+			}
+			Thread.sleep(50);
+			return ConsumerRecords.empty();
+		});
+
+		CountDownLatch latch = new CountDownLatch(1);
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener((MessageListener<String, String>) rec -> latch.countDown());
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("syncCommitContainer");
+		container.start();
+
+		assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
+		container.stop();
+
+		verify(mockConsumer).commitSync();
+		verify(mockConsumer, never()).commitAsync();
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldUseCommitAsyncWhenSyncShareCommitsIsFalse() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ConsumerRecord<String, String> record = new ConsumerRecord<>("test-topic", 0, 0L, "key", "value");
+		ConsumerRecords<String, String> records = new ConsumerRecords<>(
+				Map.of(new TopicPartition("test-topic", 0), List.of(record)), Map.of());
+
+		AtomicBoolean firstPoll = new AtomicBoolean(true);
+		given(mockConsumer.poll(any())).willAnswer(invocation -> {
+			if (firstPoll.compareAndSet(true, false)) {
+				return records;
+			}
+			Thread.sleep(50);
+			return ConsumerRecords.empty();
+		});
+
+		CountDownLatch latch = new CountDownLatch(1);
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setSyncShareCommits(false);
+		containerProperties.setMessageListener((MessageListener<String, String>) rec -> latch.countDown());
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("asyncCommitContainer");
+		container.start();
+
+		assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
+		container.stop();
+
+		verify(mockConsumer).commitAsync();
+		verify(mockConsumer, never()).commitSync();
+	}
+
+	@Test
+	void shouldAwaitConsumerThreadStartup() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+		containerProperties.setConsumerStartTimeout(Duration.ofSeconds(5));
+		containerProperties.setListenerTaskExecutor(task -> new Thread(() -> {
+			try {
+				Thread.sleep(200);
+			}
+			catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			task.run();
+		}).start());
+
+		@SuppressWarnings("unchecked")
+		ShareConsumer<String, String> consumer = mock(ShareConsumer.class);
+		given(this.shareConsumerFactory.createShareConsumer(any(), eq("startupWaitContainer"), any()))
+				.willReturn(consumer);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(this.shareConsumerFactory, containerProperties);
+		container.setBeanName("startupWaitContainer");
+
+		long start = System.nanoTime();
+		container.start();
+		long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+		try {
+			assertThat(elapsed).isGreaterThanOrEqualTo(150L);
+		}
+		finally {
+			container.stop();
+		}
+	}
+
+	@Test
+	void shouldDefaultToNoAcknowledgementCommitCallback() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		assertThat(containerProperties.getAcknowledgementCommitCallback()).isNull();
+	}
+
+	@Test
+	void shouldStoreCustomAcknowledgementCommitCallback() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		AcknowledgementCommitCallback customCallback = (offsets, exception) -> { };
+		containerProperties.setAcknowledgementCommitCallback(customCallback);
+
+		assertThat(containerProperties.getAcknowledgementCommitCallback()).isSameAs(customCallback);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldRegisterCustomCallbackOnShareConsumer() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		CountDownLatch callbackRegistered = new CountDownLatch(1);
+		AcknowledgementCommitCallback customCallback = (offsets, exception) -> { };
+
+		// Signal when callback is set on the consumer
+		lenient().doAnswer(invocation -> {
+			callbackRegistered.countDown();
+			return null;
+		}).when(mockConsumer).setAcknowledgementCommitCallback(any());
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setSyncShareCommits(false);
+		containerProperties.setAcknowledgementCommitCallback(customCallback);
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("customCallbackContainer");
+		container.start();
+		assertThat(callbackRegistered.await(5, TimeUnit.SECONDS)).isTrue();
+		container.stop();
+
+		verify(mockConsumer).setAcknowledgementCommitCallback(customCallback);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldRegisterDefaultLoggingCallbackWhenAsyncAndNoCustomCallback() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		CountDownLatch callbackRegistered = new CountDownLatch(1);
+		lenient().doAnswer(invocation -> {
+			callbackRegistered.countDown();
+			return null;
+		}).when(mockConsumer).setAcknowledgementCommitCallback(any());
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setSyncShareCommits(false);
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("defaultCallbackContainer");
+		container.start();
+
+		assertThat(callbackRegistered.await(5, TimeUnit.SECONDS)).isTrue();
+
+		container.stop();
+
+		verify(mockConsumer).setAcknowledgementCommitCallback(any(AcknowledgementCommitCallback.class));
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldNotRegisterCallbackWhenSyncCommits() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		CountDownLatch subscribed = new CountDownLatch(1);
+		lenient().doAnswer(invocation -> {
+			subscribed.countDown();
+			return null;
+		}).when(mockConsumer).subscribe(any(Collection.class));
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("noCallbackSyncContainer");
+		container.start();
+
+		assertThat(subscribed.await(5, TimeUnit.SECONDS)).isTrue();
+
+		container.stop();
+
+		verify(mockConsumer, never()).setAcknowledgementCommitCallback(any());
+	}
+
+	@SuppressWarnings("unchecked")
+	@Test
+	void shouldPublishStoppingAndStoppedEventsOnNormalShutdown() throws InterruptedException {
+		ShareConsumer<String, String> consumer = mock(ShareConsumer.class);
+		CountDownLatch pollEnteredLatch = new CountDownLatch(1);
+		CountDownLatch pollReleaseLatch = new CountDownLatch(1);
+		willAnswer(invocation -> {
+			pollEnteredLatch.countDown();
+			pollReleaseLatch.await(10, TimeUnit.SECONDS);
+			return new ConsumerRecords<>(Collections.emptyMap(), Collections.emptyMap());
+		}).given(consumer).poll(any());
+		given(shareConsumerFactory.getConfigurationProperties()).willReturn(Map.of());
+		given(shareConsumerFactory.createShareConsumer(any(), any(), any())).willReturn(consumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		CountDownLatch stoppedLatch = new CountDownLatch(1);
+		AtomicReference<Reason> stoppedReason = new AtomicReference<>();
+		AtomicReference<ShareConsumer<?, ?>> stoppingConsumer = new AtomicReference<>();
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ShareConsumerStoppingEvent stoppingEvent) {
+				stoppingConsumer.set(stoppingEvent.getConsumer());
+			}
+			else if (event instanceof ConsumerStoppedEvent stoppedEvent) {
+				stoppedReason.set(stoppedEvent.getReason());
+				stoppedLatch.countDown();
+			}
+		});
+
+		container.start();
+		assertThat(pollEnteredLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		pollReleaseLatch.countDown();
+		container.stop();
+
+		assertThat(stoppedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(stoppedReason.get()).isEqualTo(Reason.NORMAL);
+		assertThat(stoppingConsumer.get()).isSameAs(consumer);
+	}
+
+	@SuppressWarnings("unchecked")
+	@Test
+	void shouldPublishLifecycleEventsInOrder() throws InterruptedException {
+		ShareConsumer<String, String> consumer = mock(ShareConsumer.class);
+		CountDownLatch pollEnteredLatch = new CountDownLatch(1);
+		CountDownLatch pollReleaseLatch = new CountDownLatch(1);
+		willAnswer(invocation -> {
+			pollEnteredLatch.countDown();
+			pollReleaseLatch.await(10, TimeUnit.SECONDS);
+			return new ConsumerRecords<>(Collections.emptyMap(), Collections.emptyMap());
+		}).given(consumer).poll(any());
+		given(shareConsumerFactory.getConfigurationProperties()).willReturn(Map.of());
+		given(shareConsumerFactory.createShareConsumer(any(), any(), any())).willReturn(consumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		List<String> eventOrder = Collections.synchronizedList(new ArrayList<>());
+		CountDownLatch stoppedLatch = new CountDownLatch(1);
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ConsumerStartingEvent) {
+				eventOrder.add("starting");
+			}
+			else if (event instanceof ConsumerStartedEvent) {
+				eventOrder.add("started");
+			}
+			else if (event instanceof ShareConsumerStoppingEvent) {
+				eventOrder.add("stopping");
+			}
+			else if (event instanceof ConsumerStoppedEvent) {
+				eventOrder.add("stopped");
+				stoppedLatch.countDown();
+			}
+		});
+
+		container.start();
+		assertThat(pollEnteredLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		pollReleaseLatch.countDown();
+		container.stop();
+
+		assertThat(stoppedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(eventOrder).containsExactly("starting", "started", "stopping", "stopped");
+	}
+
+	@SuppressWarnings("unchecked")
+	@Test
+	void shouldPublishStoppedEventWithErrorReasonOnError() throws InterruptedException {
+		ShareConsumer<String, String> consumer = mock(ShareConsumer.class);
+		willAnswer(invocation -> {
+			throw new OutOfMemoryError("test error");
+		}).given(consumer).poll(any());
+		given(shareConsumerFactory.getConfigurationProperties()).willReturn(Map.of());
+		given(shareConsumerFactory.createShareConsumer(any(), any(), any())).willReturn(consumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		CountDownLatch stoppedLatch = new CountDownLatch(1);
+		AtomicReference<Reason> stoppedReason = new AtomicReference<>();
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ConsumerStoppedEvent stoppedEvent) {
+				stoppedReason.set(stoppedEvent.getReason());
+				stoppedLatch.countDown();
+			}
+		});
+
+		try {
+			container.start();
+			assertThat(stoppedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+			assertThat(stoppedReason.get()).isEqualTo(Reason.ERROR);
+		}
+		finally {
+			container.stop();
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	@Test
+	void shouldPublishStoppedEventWithAbnormalReasonOnException() throws InterruptedException {
+		ShareConsumer<String, String> consumer = mock(ShareConsumer.class);
+		willAnswer(invocation -> {
+			throw new RuntimeException("test exception");
+		}).given(consumer).poll(any());
+		given(shareConsumerFactory.getConfigurationProperties()).willReturn(Map.of());
+		given(shareConsumerFactory.createShareConsumer(any(), any(), any())).willReturn(consumer);
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		CountDownLatch stoppedLatch = new CountDownLatch(1);
+		AtomicReference<Reason> stoppedReason = new AtomicReference<>();
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ConsumerStoppedEvent stoppedEvent) {
+				stoppedReason.set(stoppedEvent.getReason());
+				stoppedLatch.countDown();
+			}
+		});
+
+		container.start();
+		assertThat(stoppedLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		assertThat(stoppedReason.get()).isEqualTo(Reason.ABNORMAL);
+		container.stop();
+	}
+
+	@Test
+	void shouldPublishFailedToStartEventOnInitializationFailure() {
+		given(shareConsumerFactory.getConfigurationProperties()).willReturn(Map.of());
+		given(shareConsumerFactory.createShareConsumer(any(), any(), any()))
+				.willThrow(new RuntimeException("failed to create consumer"));
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		AtomicReference<ConsumerFailedToStartEvent> failedEvent = new AtomicReference<>();
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ConsumerFailedToStartEvent failed) {
+				failedEvent.set(failed);
+			}
+		});
+
+		assertThatExceptionOfType(RuntimeException.class)
+				.isThrownBy(container::start)
+				.withMessage("failed to create consumer");
+		assertThat(failedEvent.get()).isNotNull();
+	}
+
+	@Test
+	void shouldPublishFailedToStartWhenNotAllConsumersStartWithinTimeout() throws InterruptedException {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+		containerProperties.setConsumerStartTimeout(Duration.ofMillis(50));
+		ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+		executor.setCorePoolSize(1);
+		executor.setMaxPoolSize(1);
+		executor.afterPropertiesSet();
+		containerProperties.setListenerTaskExecutor(executor);
+
+		@SuppressWarnings("unchecked")
+		ShareConsumer<String, String> firstConsumer = mock(ShareConsumer.class);
+		@SuppressWarnings("unchecked")
+		ShareConsumer<String, String> secondConsumer = mock(ShareConsumer.class);
+		given(this.shareConsumerFactory.createShareConsumer(any(), eq("failedStartContainer-0"), any()))
+				.willReturn(firstConsumer);
+		given(this.shareConsumerFactory.createShareConsumer(any(), eq("failedStartContainer-1"), any()))
+				.willReturn(secondConsumer);
+		lenient().doAnswer(invocation -> {
+			Thread.sleep(200);
+			return new ConsumerRecords<>(Collections.emptyMap(), Map.of());
+		}).when(firstConsumer).poll(Duration.ofMillis(1000));
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(this.shareConsumerFactory, containerProperties);
+		container.setBeanName("failedStartContainer");
+		container.setConcurrency(2);
+		CountDownLatch failedToStartLatch = new CountDownLatch(1);
+		container.setApplicationEventPublisher(event -> {
+			if (event instanceof ConsumerFailedToStartEvent) {
+				failedToStartLatch.countDown();
+			}
+		});
+
+		try {
+			container.start();
+			assertThat(failedToStartLatch.await(10, TimeUnit.SECONDS)).isTrue();
+		}
+		finally {
+			container.stop();
+			executor.destroy();
+		}
+	}
+
+	@Test
+	void shouldReturnEmptyClientInstanceIdsWhenNotRunning() {
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(shareConsumerFactory, containerProperties);
+
+		assertThat(container.getClientInstanceIds(Duration.ZERO)).isEmpty();
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldReturnClientInstanceIdsForRunningConsumers() {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+		Uuid instanceId = Uuid.randomUuid();
+		given(mockConsumer.clientInstanceId(any())).willReturn(instanceId);
+		lenient().when(mockConsumer.poll(any())).thenAnswer(invocation -> {
+			Thread.sleep(10);
+			return ConsumerRecords.empty();
+		});
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("clientInstanceIdContainer");
+		container.start();
+		try {
+			Map<String, Uuid> instanceIds = container.getClientInstanceIds(Duration.ZERO);
+			assertThat(instanceIds).hasSize(1).containsKey("clientInstanceIdContainer");
+			assertThat(instanceIds.get("clientInstanceIdContainer")).isEqualTo(instanceId);
+		}
+		finally {
+			container.stop();
+		}
+		assertThat(container.getClientInstanceIds(Duration.ZERO)).isEmpty();
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void shouldPropagateClientInstanceIdException() {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+		given(mockConsumer.clientInstanceId(any())).willThrow(new IllegalStateException("telemetry disabled"));
+		lenient().when(mockConsumer.poll(any())).thenAnswer(invocation -> {
+			Thread.sleep(10);
+			return ConsumerRecords.empty();
+		});
+
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setMessageListener(messageListener);
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("clientInstanceIdErrorContainer");
+		container.start();
+		try {
+			assertThatExceptionOfType(IllegalStateException.class)
+					.isThrownBy(() -> container.getClientInstanceIds(Duration.ZERO))
+					.withMessage("telemetry disabled");
+		}
+		finally {
+			container.stop();
+		}
+	}
+
+	@Test
+	void terminalAcknowledgmentIsNotDowngradedByStaleRenewNotification() throws Exception {
+		ShareAcknowledgment ack = captureManualAcknowledgment();
+		ack.renew();
+		ack.acknowledge();
+		assertThat(KafkaTestUtils.getPropertyValue(ack, "acknowledgmentType", AtomicReference.class).get())
+				.isEqualTo(AcknowledgeType.ACCEPT);
+
+		// Exactly what processQueuedAcknowledgments() does when it drains the RENEW queued before the ACCEPT
+		ReflectionTestUtils.invokeMethod(ack, "notifyAcknowledged", AcknowledgeType.RENEW);
+
+		assertThat(KafkaTestUtils.getPropertyValue(ack, "acknowledgmentType", AtomicReference.class).get())
+				.isEqualTo(AcknowledgeType.ACCEPT);
+	}
+
+	@Test
+	void secondTerminalAcknowledgmentIsStillRejectedAfterStaleRenewNotification() throws Exception {
+		ShareAcknowledgment ack = captureManualAcknowledgment();
+		ack.renew();
+		ack.acknowledge();
+		ReflectionTestUtils.invokeMethod(ack, "notifyAcknowledged", AcknowledgeType.RENEW);
+
+		assertThatIllegalStateException().isThrownBy(ack::reject);
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void queuedAcknowledgmentIsDeliveredBeforeTheConsumerIsClosed() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ConsumerRecord<String, String> record = new ConsumerRecord<>("test-topic", 0, 0L, "key", "value");
+		ConsumerRecords<String, String> records = new ConsumerRecords<>(
+				Map.of(new TopicPartition("test-topic", 0), List.of(record)), Map.of());
+		AtomicBoolean firstPoll = new AtomicBoolean(true);
+		given(mockConsumer.poll(any())).willAnswer(invocation -> {
+			if (firstPoll.compareAndSet(true, false)) {
+				return records;
+			}
+			Thread.sleep(50);
+			return ConsumerRecords.empty();
+		});
+
+		CountDownLatch listenerEntered = new CountDownLatch(1);
+		CountDownLatch releaseListener = new CountDownLatch(1);
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.MANUAL);
+		containerProperties.setMessageListener((AcknowledgingShareConsumerAwareMessageListener<String, String>)
+				(rec, acknowledgment, consumer) -> {
+					listenerEntered.countDown();
+					try {
+						releaseListener.await(10, TimeUnit.SECONDS);
+					}
+					catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+						return;
+					}
+					acknowledgment.acknowledge();
+				});
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("stopWithQueuedAckContainer");
+		container.start();
+		assertThat(listenerEntered.await(10, TimeUnit.SECONDS)).isTrue();
+
+		// Stop while the consumer thread is still inside the listener, so the acknowledgment is
+		// queued after the last drain: the loop exits straight to wrapUp() when the listener returns.
+		Thread stopper = new Thread(container::stop);
+		stopper.start();
+		int waits = 0;
+		while (container.isRunning() && waits++ < 1000) {
+			Thread.sleep(10);
+		}
+		assertThat(container.isRunning()).isFalse();
+		releaseListener.countDown();
+		stopper.join(10_000);
+
+		InOrder inOrder = inOrder(mockConsumer);
+		inOrder.verify(mockConsumer).acknowledge(record, AcknowledgeType.ACCEPT);
+		inOrder.verify(mockConsumer).close();
+	}
+
+	@SuppressWarnings("unchecked")
+	private ShareAcknowledgment captureManualAcknowledgment() throws Exception {
+		ShareConsumerFactory<String, String> mockFactory = mock(ShareConsumerFactory.class);
+		given(mockFactory.getConfigurationProperties()).willReturn(Map.of());
+		ShareConsumer<String, String> mockConsumer = mock(ShareConsumer.class);
+		given(mockFactory.createShareConsumer(any(), any(), any())).willReturn(mockConsumer);
+
+		ConsumerRecord<String, String> record = new ConsumerRecord<>("test-topic", 0, 0L, "key", "value");
+		ConsumerRecords<String, String> records = new ConsumerRecords<>(
+				Map.of(new TopicPartition("test-topic", 0), List.of(record)), Map.of());
+		AtomicBoolean firstPoll = new AtomicBoolean(true);
+		given(mockConsumer.poll(any())).willAnswer(invocation -> {
+			if (firstPoll.compareAndSet(true, false)) {
+				return records;
+			}
+			Thread.sleep(50);
+			return ConsumerRecords.empty();
+		});
+
+		AtomicReference<ShareAcknowledgment> captured = new AtomicReference<>();
+		CountDownLatch latch = new CountDownLatch(1);
+		ContainerProperties containerProperties = new ContainerProperties("test-topic");
+		containerProperties.setShareAckMode(ShareAckMode.MANUAL);
+		containerProperties.setMessageListener((AcknowledgingShareConsumerAwareMessageListener<String, String>)
+				(rec, acknowledgment, consumer) -> {
+					captured.set(acknowledgment);
+					latch.countDown();
+				});
+
+		ShareKafkaMessageListenerContainer<String, String> container =
+				new ShareKafkaMessageListenerContainer<>(mockFactory, containerProperties);
+		container.setBeanName("staleRenewContainer");
+		container.start();
+		assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
+		// Stop first so the consumer thread no longer drains the queue; everything after this is deterministic.
+		container.stop();
+
+		ShareAcknowledgment ack = captured.get();
+		assertThat(ack).isNotNull();
+		return ack;
+	}
+
+}

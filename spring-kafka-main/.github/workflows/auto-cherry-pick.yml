@@ -1,0 +1,16 @@
+name: Auto Cherry-Pick
+
+on:
+  push:
+    branches:
+      - main
+      - main-internal
+      - '*.x'
+      - '*.x-internal'
+
+jobs:
+  cherry-pick-commit:
+    uses: spring-io/spring-github-workflows/.github/workflows/spring-cherry-pick.yml@main
+    secrets:
+      GH_ACTIONS_REPO_TOKEN: ${{ secrets.GH_ACTIONS_REPO_TOKEN }}
+      NOTIFICATIONS_CHAT_WEBHOOK_URL: ${{ secrets.NOTIFICATIONS_CHAT_WEBHOOK_URL }}
